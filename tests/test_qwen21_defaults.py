@@ -53,7 +53,7 @@ def test_small_edit_keeps_reference_detail_and_area_size(monkeypatch):
 
 def test_registry_exposes_step_limits_and_no_retired_adapter():
     entries = [m for m in server.available_models() if m["id"].startswith("qwen21")]
-    assert len(entries) == 6
+    assert len(entries) == 12
     assert len(TURBO_MODELS) == 4
     for model in entries:
         assert model["snap_multiple"] == 32
