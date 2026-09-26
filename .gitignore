@@ -3,3 +3,6 @@ server.log
 __pycache__/
 *.pyc
 output/
+
+.ai_project.md
+.ai_memory.md
