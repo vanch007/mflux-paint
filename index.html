@@ -38,6 +38,7 @@
           transform-origin:0 0; will-change:transform; }
   #wrap.hide { display:none; }
   canvas { display:block; max-width:100%; max-height:calc(100vh - 96px - 28px); touch-action:none; }
+  #wrap, #view { background-image: linear-gradient(45deg, #181920 25%, transparent 25%), linear-gradient(-45deg, #181920 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #181920 75%), linear-gradient(-45deg, transparent 75%, #181920 75%); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; }
   #view { border-radius:8px; }
   #draw { position:absolute; left:0; top:0; cursor:crosshair; opacity:.35; }
   #draw.hidemask { opacity:0; }
@@ -184,6 +185,14 @@
             transform:translate(-50%,-50%); mix-blend-mode:difference; display:none; z-index:6;
             box-shadow:0 0 0 1px #0008 inset; }
   #cursor.erase { border-style:dashed; }
+  @media (max-width: 1100px) {
+    #topL { right:14px; }
+    #modelSel { min-width:0; max-width:calc(100% - 140px); }
+    #topR { top:62px; left:14px; right:14px; justify-content:flex-end; gap:6px; }
+    #topR .chip { padding:0 9px; }
+    #topR .chip.icon { padding:0; flex-shrink:0; }
+    #palette { max-height:calc(100vh - 224px); overflow:auto; }
+  }
 </style>
 </head>
 <body>
@@ -214,6 +223,7 @@
     <select class="chip" id="modelSel" title="Switch model"></select>
     <button class="chip icon" id="setBtn" title="Settings (S)"><svg class="ico" width="16" height="16"><use href="#ico-settings"></use></svg></button>
     <button class="chip icon" id="helpBtn" title="Shortcuts (?)"><svg class="ico" width="16" height="16"><use href="#ico-help"></use></svg></button>
+    <span class="chip" id="lastTime" style="display:none;font-variant-numeric:tabular-nums;color:#9cc0ff;border-color:rgba(156,192,255,0.3);background:rgba(40,50,75,0.5);" title="Last generation time">⏱ —</span>
   </div>
   <!-- top-right: image actions (appear once an image is loaded) -->
   <div id="topR" class="float hide">
@@ -244,6 +254,9 @@
     <h4>GENERATION</h4>
     <div class="row"><label>Steps</label>
       <input id="steps" type="range" min="2" max="50" value="20"><span class="val" id="stepsV">20</span></div>
+    <div class="hint" id="turboHint">Viggle v0.2.1：6 步常用，8 步可试细节改善。LoRA 官方强度 1；0.85 为画质对比选项。Guidance 保持 1。</div>
+    <div class="row" id="loraRow"><label>LoRA Scale</label>
+      <input id="loraScale" type="number" min="0.05" max="2" step="0.05" value="1"></div>
     <div class="row"><label>Guidance</label>
       <input id="guid" type="range" min="0" max="60" step="0.5" value="30"><span class="val" id="guidV">30</span></div>
     <div class="row" id="sizeRow"><label>Resolution</label>
@@ -251,12 +264,14 @@
         <option value="0" selected>Auto</option>
         <option value="384">384</option><option value="512">512</option>
         <option value="640">640</option><option value="768">768</option><option value="1024">1024</option>
+        <option value="1536">1536</option><option value="2048">2048</option>
       </select></div>
     <div class="row" id="autoRow"><label>Detected</label><span class="val" id="autoInfo">—</span></div>
+    <div class="hint" id="nativeEditHint">Auto 保留原图尺寸，最大约 1536² 像素。整图编辑导出实际生成尺寸；画蒙版时保留画布尺寸。</div>
     <div class="row" id="dimsRow"><label>Width × Height</label>
       <span class="pair">
-        <input id="genW" type="number" min="256" max="1536" step="16" value="1024">
-        <input id="genH" type="number" min="256" max="1536" step="16" value="1024">
+        <input id="genW" type="number" min="256" max="4096" step="16" value="1024">
+        <input id="genH" type="number" min="256" max="4096" step="16" value="1024">
       </span></div>
     <div class="row" id="negRow"><label>Negative</label><input id="negPrompt" type="text" placeholder="none"></div>
     <div class="row"><label>Quantize</label>
@@ -330,6 +345,7 @@
   <div id="bar">
     <button class="toolbtn" id="presetBtn" title="Saved prompts">☰</button>
     <input id="prompt" placeholder="Describe the edit… (remove it / add a cat / a red car)">
+    <button class="toolbtn" id="rewriteBtn" title="AI 提示词增强 / Rewrite Prompt (oMLX Qwen-35B)">✨</button>
     <button id="run" disabled>Run</button>
   </div>
 
@@ -341,6 +357,7 @@ const view=$('#view'), draw=$('#draw'), vctx=view.getContext('2d'), dctx=draw.ge
 let mask, mctx;                       // transparent bg + white strokes = source of truth
 let hasImage=false, hasMask=false, busy=false, erasing=false;
 let beforeImg=null;                   // original (for compare), as Image
+let currentImageURL=null;
 let models=[], curModel=null, saveDir='';
 
 /* ---------- toast / err ---------- */
@@ -360,14 +377,27 @@ function showProgress(on){ $('#busy').classList.toggle('on',on);
 function modelById(id){ return models.find(m=>m.id===id); }
 let imgW=0, imgH=0;
 function applyModelDefaults(){ const m=modelById(curModel); if(!m)return;
+  const choices=m.step_choices;
+  $('#steps').min=choices?choices[0]:2; $('#steps').max=choices?choices[choices.length-1]:50;
+  $('#steps').step=choices?2:1; $('#guid').disabled=m.fixed_guidance!=null;
+  $('#genW').step=$('#genH').step=m.snap_multiple||16;
+  $('#turboHint').classList.toggle('on', !!choices);
   $('#steps').value=m.steps||20; $('#guid').value=(m.guidance??3.5);
+  $('#loraScale').value=m.lora_scale??1;
   syncSettingLabels(); updateSizeHint(); updateAutoInfo(); updateModeRows(); updateRunEnabled(); }
 function syncSettingLabels(){ $('#stepsV').textContent=$('#steps').value;
   $('#guidV').textContent=$('#guid').value; }
-function genDims(w,h){                 // mirror server gen_size: scale long side into [256, cap]
-  const m=modelById(curModel); const cap=(+$('#size').value)||(m?m.gen_max:512), gmin=256;
+function genDims(w,h){
+  const m=modelById(curModel); const requested=+$('#size').value, gmin=256;
+  let cap=requested||(m?m.gen_max:512);
+  const multiple=m?.snap_multiple||16;
+  const snap=v=>Math.max(multiple,Math.round(v/multiple)*multiple);
+  if(!requested && m?.native_edit){
+    cap=m.auto_area_limit;
+    if(w*h<=cap*cap) return [snap(w),snap(h)];
+  }
+  if(m?.resolution_mode==='area') return [snap(cap*Math.sqrt(w/h)),snap(cap/Math.sqrt(w/h))];
   const long=Math.max(w,h); const s = long<gmin?gmin/long : long>cap?cap/long : 1;
-  const snap=v=>Math.max(16,Math.round(v/16)*16);
   return [snap(w*s), snap(h*s)]; }
 function updateAutoInfo(){ if(!imgW){ $('#autoInfo').textContent='—'; return; }
   const auto = +$('#size').value===0; const [gw,gh]=genDims(imgW,imgH);
@@ -380,6 +410,8 @@ function updateModeRows(){ const m=modelById(curModel); if(!m)return;
   $('#autoRow').style.display = t2i?'none':'';
   $('#dimsRow').style.display = t2i?'':'none';
   $('#negRow').style.display = m.neg?'':'none';
+  $('#loraRow').style.display = m.lora_scale!=null?'':'none';
+  $('#nativeEditHint').classList.toggle('on', !!m.native_edit);
   $('#maskHint').classList.toggle('on', !!m.needs_mask);
   $('#dlHint').classList.toggle('on', !m.cached);
   $('#removeCustomModel').style.display = curModel.startsWith('custom:') ? '' : 'none'; }
@@ -441,6 +473,7 @@ function loadImage(src){
   hideBatchPick();
   const im=new Image();
   im.onload=()=>{
+    currentImageURL=src;
     view.width=draw.width=im.naturalWidth; view.height=draw.height=im.naturalHeight;
     vctx.drawImage(im,0,0);
     mask=document.createElement('canvas'); mask.width=im.naturalWidth; mask.height=im.naturalHeight;
@@ -571,7 +604,7 @@ $('#resetZoom').onclick=resetT;
 let compareSnap=null;
 function startCompare(){ if(!beforeImg||!hasImage||compareSnap||!beforeImg.complete)return;
   compareSnap=vctx.getImageData(0,0,view.width,view.height);
-  vctx.drawImage(beforeImg,0,0); draw.classList.add('hidemask'); }
+  vctx.drawImage(beforeImg,0,0,view.width,view.height); draw.classList.add('hidemask'); }
 function endCompare(){ if(compareSnap){ vctx.putImageData(compareSnap,0,0);
   draw.classList.remove('hidemask'); compareSnap=null; } }
 const cmp=$('#compareBtn');
@@ -586,10 +619,11 @@ async function run(){
   const prompt=$('#prompt').value.trim();
   if(!prompt){ showErr('write a prompt'); $('#prompt').focus(); return; }
   let beforeURL=null;
-  if(hasImage){ beforeURL=view.toDataURL('image/png'); beforeImg=new Image(); beforeImg.src=beforeURL; }
+  if(hasImage){ beforeURL=currentImageURL; beforeImg=new Image(); beforeImg.src=beforeURL; }
   busy=true; $('#run').disabled=true; showProgress(true); hideBatchPick();
   try{
     const body={ prompt, model:curModel, steps:+$('#steps').value, guidance:+$('#guid').value };
+    if(m.lora_scale!=null) body.lora_scale=+$('#loraScale').value;
     const neg=$('#negPrompt').value.trim(); if(neg) body.negative_prompt=neg;
     const q=$('#quant').value; if(q) body.quantize=q;
     const sd=$('#seed').value.trim(); if(sd) body.seed=sd;
@@ -603,10 +637,16 @@ async function run(){
     const r=await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const j=await r.json(); if(j.error) throw new Error(j.error);
     curJob=j.job;
-    const images=await pollProgress(curJob);     // resolves with an array of result dataURLs (1+ per seed)
+    const res=await pollProgress(curJob);
+    const images=Array.isArray(res) ? res : res.images;
+    const elapsed=(res && res.elapsed !== undefined) ? res.elapsed : ((performance.now()-T0)/1000).toFixed(1);
     if(beforeURL){ imgHistory.push(beforeURL); if(imgHistory.length>20)imgHistory.shift(); $('#revertBtn').disabled=false; }
     loadImage(images[0]);          // result becomes new base (chain edits)
     if(images.length>1) showBatchPick(images);
+    const dimensions=res?.dimensions?.[0];
+    $('#lastTime').textContent = `⏱ ${elapsed}s${dimensions?' · '+dimensions.join('×'):''}`;
+    $('#lastTime').style.display = 'inline-flex';
+    toast(`Done in ${elapsed}s` + (images.length > 1 ? ` (${images.length} variations)` : ''));
   }catch(e){ if(e.message!=='cancelled') showErr(e.message); }
   finally{ busy=false; curJob=null; showProgress(false); updateRunEnabled(); }
 }
@@ -640,7 +680,7 @@ function pollProgress(job){
         $('#pFill').style.width=(frac*100).toFixed(1)+'%';
         $('#pPct').textContent=Math.round(frac*100)+'%';
         $('#pPhase').textContent='Generating…';
-        $('#pStep').textContent=`step ${step} / ${total}`;
+        const sec=((performance.now()-T0)/1000).toFixed(1); $('#pStep').textContent=`step ${step} / ${total} (${sec}s)`;
         const dt=(performance.now()-dT0)/1000, done=step-dStep0;
         if(done>0){ const eta=(dt/done)*(total-step); $('#pEta').textContent='~'+fmt(eta)+' left'; }
         else $('#pEta').textContent='';
@@ -649,7 +689,7 @@ function pollProgress(job){
         $('#pPct').textContent='100%'; $('#pPhase').textContent='Finalizing…';
         $('#pStep').textContent=''; $('#pEta').textContent='almost done';
       }
-      if(p.status==='done'){ (p.images&&p.images.length)?resolve(p.images):reject(new Error('no image')); return; }
+      if(p.status==='done'){ (p.images&&p.images.length)?resolve(p):reject(new Error('no image')); return; }
       setTimeout(tick,300);
     };
     tick();
@@ -662,7 +702,7 @@ $('#revertBtn').onclick=()=>{ if(!imgHistory.length)return;
   loadImage(imgHistory.pop()); $('#revertBtn').disabled=!imgHistory.length; toast('Reverted'); };
 async function copyImage(){ try{
   const r=await fetch('/copy',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({image:view.toDataURL('image/png')})});
+    body:JSON.stringify({image:currentImageURL})});
   const j=await r.json(); if(j.error)throw new Error(j.error); toast('Copied to clipboard');
 }catch(e){ showErr('copy failed: '+e.message); } }
 $('#copyBtn').onclick=copyImage;
@@ -673,14 +713,52 @@ function toggleMaskVis(){ draw.classList.toggle('hidemask');
   if(b){ b.classList.toggle('on',h); b.innerHTML = h?EYE_OFF:EYE; }
   toast(h?'Mask hidden':'Mask shown'); }
 $('#run').onclick=run;
+$('#rewriteBtn').onclick = async () => {
+  const p = $('#prompt').value.trim();
+  if(!p) { showErr('Please enter a prompt first'); return; }
+  const btn = $('#rewriteBtn');
+  const orig = btn.textContent;
+  btn.textContent = '⏳'; btn.disabled = true;
+  try {
+    const m = modelById(curModel);
+    const task = (m && m.shape === 'txt2img') ? 't2i' : 'edit';
+    const r = await fetch('/rewrite-prompt', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt: p, task: task})
+    });
+    const j = await r.json();
+    if(j.error) throw new Error(j.error);
+    if(j.rewritten_prompt) {
+      $('#prompt').value = j.rewritten_prompt;
+      toast('Prompt rewritten by Qwen-35B');
+      if(j.wh_ratio && m && m.shape === 'txt2img') {
+        const ratios = {
+          '1:1': [1024, 1024], '16:9': [1376, 768], '9:16': [768, 1376],
+          '4:3': [1184, 896], '3:4': [896, 1184], '3:2': [1248, 832], '2:3': [832, 1248]
+        };
+        if(ratios[j.wh_ratio]) {
+          $('#genW').value = ratios[j.wh_ratio][0];
+          $('#genH').value = ratios[j.wh_ratio][1];
+          updateAutoInfo();
+        }
+      }
+    }
+  } catch(e) {
+    showErr(e.message || 'rewrite failed');
+  } finally {
+    btn.textContent = orig; btn.disabled = false;
+  }
+};
 $('#prompt').addEventListener('keydown',e=>{ if(e.key==='Enter'){e.preventDefault();run();} });
 
 /* ---------- save / folder ---------- */
 $('#saveFile').onclick=()=>{ const a=document.createElement('a');
-  a.href=view.toDataURL('image/png'); a.download='mflux-paint.png'; a.click(); toast('Downloaded'); };
+  a.href=currentImageURL?.startsWith('data:image/png')?currentImageURL:view.toDataURL('image/png');
+  a.download='mflux-paint.png'; a.click(); toast('Downloaded'); };
 $('#saveFolder').onclick=async()=>{ try{
   const r=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({image:view.toDataURL('image/png')})});
+    body:JSON.stringify({image:currentImageURL})});
   const j=await r.json(); if(j.error)throw new Error(j.error); toast('Saved · '+j.name);
 }catch(e){ showErr(e.message); } };
 $('#openFolder').onclick=()=>fetch('/open',{method:'POST'}).catch(()=>{});
@@ -736,6 +814,7 @@ addEventListener('keydown',e=>{
   else if(e.key==='Backspace'||e.key==='Delete') clearMask();
   else if(e.key==='0') resetT();
   else if(e.key==='?') togglePop($('#helpPop'),$('#helpBtn'));
+  else if(e.key==='s'||e.key==='S') togglePop($('#setPop'),$('#setBtn'));
   else if(e.key==='c'||e.key==='C') startCompare();
 });
 addEventListener('keyup',e=>{ if(e.key==='c'||e.key==='C')endCompare(); });

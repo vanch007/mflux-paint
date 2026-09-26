@@ -4,23 +4,14 @@ No torch. Shells out to mflux CLIs. Model registry covers whole-image edit,
 true inpaint (fill) and text-to-image, each with a different mflux CLI shape.
 Saved prompts, save-to-folder, model picker, multi-seed batches.
 """
-import base64, glob, http.server, io, json, os, re, shutil, subprocess, tempfile, socketserver, threading, time, urllib.parse
-from PIL import Image, ImageChops, ImageFilter
+import base64, glob, http.server, io, json, math, os, re, shutil, subprocess, tempfile, socketserver, threading, time, urllib.parse, urllib.request
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 # auto-shutdown: the open page pings /alive; no ping for IDLE_TIMEOUT -> exit.
 LAST_PING = [time.time()]
-IDLE_TIMEOUT = 20
+IDLE_TIMEOUT = int(os.environ.get("MFLUX_PAINT_TIMEOUT", "600"))
 def _watchdog():
-    while True:
-        time.sleep(5)
-        if time.time() - LAST_PING[0] > IDLE_TIMEOUT:
-            with JLOCK:                       # kill any in-flight mflux subprocess before exiting
-                for j in JOBS.values():
-                    p = j.get("_proc")
-                    if p and p.poll() is None:
-                        try: p.terminate()
-                        except Exception: pass
-            os._exit(0)
+    return
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 7866
@@ -31,8 +22,12 @@ CUSTOM_MODELS_FILE = os.path.join(CFG_DIR, "custom_models.json")
 # auto-detect where `uv tool install mflux` / pipx put the mflux-generate-* binaries,
 # falling back to the Homebrew default if they're not on PATH (e.g. launched from a
 # GUI context that doesn't inherit the shell's PATH).
-_mflux_bin = shutil.which("mflux-generate")
-BIN = os.path.dirname(_mflux_bin) if _mflux_bin else "/opt/homebrew/bin"
+LOCAL_PR736_BIN = "/Users/vanch/mflux-pr736/.venv/bin"
+if os.path.exists(os.path.join(LOCAL_PR736_BIN, "mflux-generate-qwen-2.1-edit")):
+    BIN = LOCAL_PR736_BIN
+else:
+    _mflux_bin = shutil.which("mflux-generate-qwen-2.1-edit") or shutil.which("mflux-generate")
+    BIN = os.path.dirname(_mflux_bin) if _mflux_bin else "/opt/homebrew/bin"
 
 # --- model registry -------------------------------------------------------------
 # "shape" controls how the mflux CLI command is built (see build_cmd):
@@ -53,6 +48,30 @@ BIN = os.path.dirname(_mflux_bin) if _mflux_bin else "/opt/homebrew/bin"
 # against real output. Override in Settings once you've actually run one.
 MODELS = {
     # ---------------------------------------------------------------- edit
+    "qwen21-turbo-r128-edit": {
+        "native_edit": True, "auto_area_limit": 1536, "lora_scale": 1.0,
+        "label": "Qwen-Image-2.1 · Turbo Edit (r128 · 6步)", "group": "Edit",
+        "bin": f"{BIN}/mflux-generate-qwen-2.1-edit",
+        "model": None, "base": None, "shape": "edit_multi",
+        "gen_max": 1024, "steps": 6, "guidance": 1.0, "needs_mask": False, "cached": True, "neg": False,
+        "snap_multiple": 32, "resolution_mode": "area", "step_choices": [6, 8], "fixed_guidance": 1.0, "extra_args": ["--lora-preset", "viggle-turbo", "--lora", "Viggle/Qwen-Image-2.1-viggle-turbo:Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors", "1.0", "--scheduler", "viggle_turbo", "--no-bake-lora", "--use-kv-cache", "--output-resolution", "1024", "--reference-resolution", "1024"],
+    },
+    "qwen21-turbo-r256-edit": {
+        "native_edit": True, "auto_area_limit": 1536, "lora_scale": 1.0,
+        "label": "Qwen-Image-2.1 · Turbo Edit (r256 完整秩)", "group": "Edit",
+        "bin": f"{BIN}/mflux-generate-qwen-2.1-edit",
+        "model": None, "base": None, "shape": "edit_multi",
+        "gen_max": 1024, "steps": 6, "guidance": 1.0, "needs_mask": False, "cached": True, "neg": False,
+        "snap_multiple": 32, "resolution_mode": "area", "step_choices": [6, 8], "fixed_guidance": 1.0, "extra_args": ["--lora-preset", "viggle-turbo", "--lora", "Viggle/Qwen-Image-2.1-viggle-turbo:Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors", "1.0", "--scheduler", "viggle_turbo", "--no-bake-lora", "--use-kv-cache", "--output-resolution", "1024", "--reference-resolution", "1024"],
+    },
+    "qwen21-edit": {
+        "native_edit": True, "auto_area_limit": 1536,
+        "label": "Qwen-Image-2.1 · Quality Edit (40 steps)", "group": "Edit",
+        "bin": f"{BIN}/mflux-generate-qwen-2.1-edit",
+        "model": None, "base": None, "shape": "edit_multi",
+        "gen_max": 1024, "steps": 40, "guidance": 1.0, "needs_mask": False, "cached": True, "neg": False,
+        "snap_multiple": 32, "resolution_mode": "area", "fixed_guidance": 1.0, "extra_args": ["--use-kv-cache", "--output-resolution", "1024", "--reference-resolution", "1024"],
+    },
     "klein-4b": {
         "label": "FLUX.2 Klein-4B · fast edit", "group": "Edit",
         "bin": f"{BIN}/mflux-generate-flux2-edit",
@@ -100,6 +119,29 @@ MODELS = {
         "gen_max": 1024, "steps": 25, "guidance": 30, "needs_mask": True, "cached": False,
     },
     # ---------------------------------------------------------------- text-to-image
+    "qwen21-turbo-r128-t2i": {
+        "lora_scale": 1.0,
+        "label": "Qwen-Image-2.1 · Turbo T2I (r128 · 6步)", "group": "Text-to-image",
+        "bin": f"{BIN}/mflux-generate-qwen-2.1-edit",
+        "model": None, "base": None, "shape": "txt2img",
+        "gen_max": 1024, "steps": 6, "guidance": 1.0, "needs_mask": False, "cached": True, "neg": False,
+        "snap_multiple": 32, "resolution_mode": "area", "step_choices": [6, 8], "fixed_guidance": 1.0, "extra_args": ["--lora-preset", "viggle-turbo", "--lora", "Viggle/Qwen-Image-2.1-viggle-turbo:Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors", "1.0", "--scheduler", "viggle_turbo", "--no-bake-lora", "--use-kv-cache", "--output-resolution", "1024", "--reference-resolution", "1024"],
+    },
+    "qwen21-turbo-r256-t2i": {
+        "lora_scale": 1.0,
+        "label": "Qwen-Image-2.1 · Turbo T2I (r256 完整秩)", "group": "Text-to-image",
+        "bin": f"{BIN}/mflux-generate-qwen-2.1-edit",
+        "model": None, "base": None, "shape": "txt2img",
+        "gen_max": 1024, "steps": 6, "guidance": 1.0, "needs_mask": False, "cached": True, "neg": False,
+        "snap_multiple": 32, "resolution_mode": "area", "step_choices": [6, 8], "fixed_guidance": 1.0, "extra_args": ["--lora-preset", "viggle-turbo", "--lora", "Viggle/Qwen-Image-2.1-viggle-turbo:Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors", "1.0", "--scheduler", "viggle_turbo", "--no-bake-lora", "--use-kv-cache", "--output-resolution", "1024", "--reference-resolution", "1024"],
+    },
+    "qwen21-t2i": {
+        "label": "Qwen-Image-2.1 · Quality Text-to-Image", "group": "Text-to-image",
+        "bin": f"{BIN}/mflux-generate-qwen-2.1-edit",
+        "model": None, "base": None, "shape": "txt2img",
+        "gen_max": 1024, "steps": 40, "guidance": 1.0, "needs_mask": False, "cached": True, "neg": False,
+        "snap_multiple": 32, "resolution_mode": "area", "fixed_guidance": 1.0, "extra_args": ["--use-kv-cache", "--output-resolution", "1024", "--reference-resolution", "1024"],
+    },
     "dev": {
         "label": "FLUX.1 dev · text-to-image", "group": "Text-to-image",
         "bin": f"{BIN}/mflux-generate", "model": "dev", "base": "dev", "shape": "txt2img",
@@ -170,7 +212,11 @@ def available_models():
     out = [{"id": k, "label": m["label"], "group": m["group"],
             "cached": m["cached"], "shape": m["shape"], "needs_mask": m["needs_mask"],
             "steps": m["steps"], "guidance": m["guidance"], "gen_max": m["gen_max"],
-            "neg": m.get("neg", True)}
+            "neg": m.get("neg", True), "snap_multiple": m.get("snap_multiple", 16),
+            "step_choices": m.get("step_choices"), "fixed_guidance": m.get("fixed_guidance"),
+            "resolution_mode": m.get("resolution_mode", "long_side"),
+            "native_edit": m.get("native_edit", False), "auto_area_limit": m.get("auto_area_limit"),
+            "lora_scale": m.get("lora_scale")}
            for k, m in MODELS.items()]
     for entry in load_custom_models():
         spec = custom_spec(entry)
@@ -178,7 +224,11 @@ def available_models():
         out.append({"id": f"custom:{entry['id']}", "label": spec["label"], "group": "Custom",
                      "cached": True, "shape": spec["shape"], "needs_mask": spec["needs_mask"],
                      "steps": spec["steps"], "guidance": spec["guidance"], "gen_max": spec["gen_max"],
-                     "neg": spec.get("neg", True)})
+                     "neg": spec.get("neg", True), "snap_multiple": spec.get("snap_multiple", 16),
+                     "step_choices": spec.get("step_choices"), "fixed_guidance": spec.get("fixed_guidance"),
+                     "resolution_mode": spec.get("resolution_mode", "long_side"),
+                     "native_edit": spec.get("native_edit", False), "auto_area_limit": spec.get("auto_area_limit"),
+                     "lora_scale": spec.get("lora_scale")})
     return out
 
 # --- custom (locally-saved) models -----------------------------------------------
@@ -224,16 +274,28 @@ def resolve_spec(mid):
     return MODELS.get(mid)
 
 # --- geometry helpers -----------------------------------------------------------
-def snap16(v): return max(16, int(round(v / 16)) * 16)
-def gen_size(w, h, gmax, gmin=256):
+def snap(v, m=16): return max(m, int(round(v / m)) * m)
+def snap16(v): return snap(v, 16)
+def gen_size(w, h, gmax, gmin=256, m=16):
     long = max(w, h)
     s = gmin / long if long < gmin else gmax / long if long > gmax else 1.0
-    return snap16(w * s), snap16(h * s)
+    return snap(w * s, m), snap(h * s, m)
+def edit_size(spec, w, h, requested):
+    m = spec.get("snap_multiple", 16)
+    if spec.get("resolution_mode") != "area":
+        return gen_size(w, h, requested or spec["gen_max"], m=m)
+    if not requested and spec.get("native_edit"):
+        cap = spec["auto_area_limit"]
+        if w * h <= cap * cap:
+            return snap(w, m), snap(h, m)
+    else:
+        cap = requested or spec["gen_max"]
+    return snap(cap * math.sqrt(w / h), m), snap(cap / math.sqrt(w / h), m)
 def feather_px(w, h): return max(2, min(24, int(round(min(w, h) * 0.02))))
 
 def b64_to_img(data):
     if "," in data: data = data.split(",", 1)[1]
-    return Image.open(io.BytesIO(base64.b64decode(data)))
+    return ImageOps.exif_transpose(Image.open(io.BytesIO(base64.b64decode(data))))
 def img_to_b64(img):
     buf = io.BytesIO(); img.save(buf, "PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
@@ -249,9 +311,20 @@ def _jget(jid):
 
 def build_cmd(spec, prompt, steps, guidance, seeds, negative_prompt, quantize, gw, gh, gout, gin=None, gmask=None):
     """Pure command-builder (no I/O) so the CLI shape per model can be unit-tested directly."""
+    if spec.get("step_choices") and steps not in spec["step_choices"]:
+        raise ValueError("Viggle v0.2.1 supports 6 steps (default) or 8 steps for text detail.")
+    if spec.get("fixed_guidance") is not None and (guidance != spec["fixed_guidance"] or negative_prompt):
+        raise ValueError(f"{spec['label']} requires Guidance {spec['fixed_guidance']:g} and no negative prompt.")
     cmd = [spec["bin"]]
     if spec.get("model"): cmd += ["-m", spec["model"]]
     if spec.get("base"): cmd += ["--base-model", spec["base"]]
+    extra_args = list(spec.get("extra_args", []))
+    if spec.get("lora_scale") is not None:
+        scale = float(spec["lora_scale"])
+        if not math.isfinite(scale) or not 0 < scale <= 2:
+            raise ValueError("LoRA scale must be greater than 0 and at most 2.")
+        extra_args[extra_args.index("--lora") + 2] = str(scale)
+    cmd += extra_args
     cmd += ["--prompt", prompt]
     if negative_prompt: cmd += ["--negative-prompt", negative_prompt]
     if gh: cmd += ["--height", str(gh)]
@@ -332,6 +405,8 @@ CHANGE_LEVEL = 32
 GLOBAL_LEVEL = 10
 
 def keep_untouched(out, base):
+    if getattr(out, 'mode', '') == 'RGBA' or getattr(base, 'mode', '') == 'RGBA':
+        return out
     """Restore the pixels a whole-image edit was never asked to change.
 
     Edit models re-encode the entire frame through the VAE, so areas the prompt
@@ -360,12 +435,23 @@ def keep_untouched(out, base):
     m = m.filter(ImageFilter.GaussianBlur(max(1, f // 2)))
     return Image.composite(out, base, m)
 
+
+def _read_output_image(f, size=None):
+    im = Image.open(f)
+    if im.mode != 'RGBA':
+        im = im.convert('RGB')
+    if size and im.size != size:
+        im = im.resize(size, Image.Resampling.LANCZOS)
+    return im
+
 def run_edit_or_fill(spec, base, mask, prompt, steps, guidance, seeds, gen_max, jid, negative_prompt, quantize):
     cw, ch = base.size
-    gw, gh = gen_size(cw, ch, gen_max)
+    gw, gh = edit_size(spec, cw, ch, gen_max)
     with tempfile.TemporaryDirectory() as d:
         gin = os.path.join(d, "in.png"); out = os.path.join(d, "out.png")
-        base.resize((gw, gh)).save(gin)
+        # Qwen encodes references at a separate 1024² budget, even for small output.
+        source = base if spec.get("resolution_mode") == "area" else base.resize((gw, gh))
+        source.save(gin)
         gmask = None
         if mask is not None and spec["shape"] in ("fill", "edit_mask"):
             gmask = os.path.join(d, "mask.png")
@@ -373,18 +459,21 @@ def run_edit_or_fill(spec, base, mask, prompt, steps, guidance, seeds, gen_max, 
         spec = _local_model_spec(spec, d)
         cmd = build_cmd(spec, prompt, steps, guidance, seeds, negative_prompt, quantize, gw, gh, out, gin, gmask)
         _popen_stream(cmd, steps, jid)
-        return [Image.open(f).convert("RGB").resize((cw, ch)) for f in _collect_outputs(out)]
+        size = None if spec.get("native_edit") and mask is None else (cw, ch)
+        return [_read_output_image(f, size) for f in _collect_outputs(out)]
 
 def run_txt2img(spec, prompt, steps, guidance, seeds, width, height, jid, negative_prompt, quantize):
-    gw, gh = snap16(width), snap16(height)
+    m = spec.get("snap_multiple", 16)
+    gw, gh = snap(width, m), snap(height, m)
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "out.png")
         spec = _local_model_spec(spec, d)
         cmd = build_cmd(spec, prompt, steps, guidance, seeds, negative_prompt, quantize, gw, gh, out)
         _popen_stream(cmd, steps, jid)
-        return [Image.open(f).convert("RGB") for f in _collect_outputs(out)]
+        return [_read_output_image(f) for f in _collect_outputs(out)]
 
 def _run_job(jid, payload, spec):
+    t_start = time.perf_counter()
     try:
         shape = spec["shape"]
         prompt = payload["prompt"].strip()
@@ -396,6 +485,8 @@ def _run_job(jid, payload, spec):
         quantize = payload.get("quantize") or None
         seed_raw = str(payload.get("seed") or "").strip()
         seeds = [s.strip() for s in seed_raw.split(",") if s.strip()] or None
+        if spec.get("lora_scale") is not None and payload.get("lora_scale") is not None:
+            spec = {**spec, "lora_scale": float(payload["lora_scale"])}
 
         # optional local weights override: mflux's own -m/--model accepts a HF repo
         # name, org/model, OR a local filesystem path - if the user points us at a
@@ -412,8 +503,8 @@ def _run_job(jid, payload, spec):
             height = int(payload.get("height") or 1024)
             results = run_txt2img(spec, prompt, steps, guidance, seeds, width, height, jid, negative_prompt, quantize)
         else:
-            base = b64_to_img(payload["image"]).convert("RGB")
-            gen_max = int(payload.get("size") or spec["gen_max"])
+            base = b64_to_img(payload["image"]); base = base if base.mode in ("RGB", "RGBA") else base.convert("RGB")
+            gen_max = int(payload.get("size") or 0)
             mask_data = payload.get("mask"); mask = None
             if mask_data:
                 mm = b64_to_img(mask_data)
@@ -421,7 +512,7 @@ def _run_job(jid, payload, spec):
             if mask is None or not mask.getbbox():
                 mask = Image.new("L", base.size, 255) if shape == "fill" else None
             results = run_edit_or_fill(spec, base, mask, prompt, steps, guidance, seeds, gen_max, jid, negative_prompt, quantize)
-            if mask is None and payload.get("keep_untouched", True):
+            if mask is None and not spec.get("native_edit") and payload.get("keep_untouched", True):
                 # no user mask, so derive one from what the model actually changed
                 results = [keep_untouched(r, base) for r in results]
             if mask is not None:   # keep everything outside the mask pixel-exact (feathered seam)
@@ -430,7 +521,9 @@ def _run_job(jid, payload, spec):
                 soft = soft.filter(ImageFilter.GaussianBlur(max(1, f // 2)))
                 results = [Image.composite(r, base, soft) for r in results]
         images = [img_to_b64(r) for r in results]
-        _jset(jid, status="done", phase="done", step=steps or 0, total=steps or 0, images=images)
+        elapsed = round(time.perf_counter() - t_start, 2)
+        _jset(jid, status="done", phase="done", step=steps or 0, total=steps or 0,
+              images=images, elapsed=elapsed, dimensions=[list(r.size) for r in results])
     except Exception as e:
         with JLOCK: cancelled = JOBS.get(jid, {}).get("_cancel")
         _jset(jid, status="error", error="cancelled" if cancelled else str(e)[-1500:])
@@ -488,7 +581,8 @@ def save_prompts(d):
 # --- save / open folder ---------------------------------------------------------
 def handle_save(payload):
     os.makedirs(SAVE_DIR, exist_ok=True)
-    img = b64_to_img(payload["image"]).convert("RGB")
+    img = b64_to_img(payload["image"])
+    if img.mode not in ("RGB", "RGBA"): img = img.convert("RGBA")
     name = payload.get("name") or f"mflux-{time.strftime('%Y%m%d-%H%M%S')}.png"
     if not name.lower().endswith(".png"): name += ".png"
     name = os.path.basename(name)
@@ -503,7 +597,8 @@ def handle_copy(payload):
     # pywebview's WKWebView often refuses navigator.clipboard.write() for images
     # (silent NotAllowedError). Go through the system pasteboard instead via osascript,
     # which works regardless of WebView clipboard permissions.
-    img = b64_to_img(payload["image"]).convert("RGB")
+    img = b64_to_img(payload["image"])
+    if img.mode not in ("RGB", "RGBA"): img = img.convert("RGBA")
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         img.save(f.name)
         path = f.name
@@ -516,6 +611,56 @@ def handle_copy(payload):
     return {"ok": True}
 
 # --- http -----------------------------------------------------------------------
+
+def handle_rewrite_prompt(payload):
+    prompt = (payload.get('prompt') or '').strip()
+    if not prompt: raise ValueError('Prompt is empty')
+    task = payload.get('task', 't2i')
+    if task == 'edit':
+        sys_prompt = (
+            'You are an expert image editing prompt enhancer for Qwen-Image-2.1. '
+            'Turn the user\'s short instruction into a detailed, descriptive prompt stating '
+            'what changes to make and what details/identity to preserve. '
+            'Return valid JSON: {\"rewritten_prompt\": \"...\"}'
+        )
+    else:
+        sys_prompt = (
+            'You turn a user\'s image request into one long English paragraph describing the '
+            'finished image as if you were looking at it in vivid photorealistic detail, '
+            'plus the optimal aspect ratio (e.g. 1:1, 16:9, 9:16, 4:3, 3:4). '
+            'If transparency or a sticker is mentioned, explicitly include: '
+            "'This is an RGBA image with transparency. ... The image has alpha channel and the background is transparent.' "
+            'Return valid JSON: {\"rewritten_prompt\": \"...\", \"wh_ratio\": \"16:9\"}'
+        )
+    url = 'http://127.0.0.1:8000/v1/chat/completions'
+    model = 'Qwen3.6-35B-A3B-Uncensored-Genesis-Hermes-V13-dequantized-oQ6e-fp16-mtp'
+    body = {
+        'model': model,
+        'messages': [
+            {'role': 'system', 'content': sys_prompt},
+            {'role': 'user', 'content': prompt}
+        ],
+        'temperature': 0.7,
+        'max_tokens': 512
+    }
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        data = json.loads(resp.read().decode())
+        content = data['choices'][0]['message']['content'].strip()
+        if '```' in content:
+            parts = content.split('```')
+            if len(parts) >= 2:
+                content = parts[1]
+                if content.startswith('json'): content = content[4:].strip()
+        try:
+            parsed = json.loads(content.strip())
+            return {
+                'rewritten_prompt': parsed.get('rewritten_prompt', content),
+                'wh_ratio': parsed.get('wh_ratio', '')
+            }
+        except Exception:
+            return {'rewritten_prompt': content, 'wh_ratio': ''}
+
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _send(self, code, body, ctype="application/json"):
@@ -557,6 +702,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             if self.path == "/run":       return self._send(200, json.dumps(handle_run(self._json())))
+            if self.path == "/rewrite-prompt": return self._send(200, json.dumps(handle_rewrite_prompt(self._json())))
             if self.path.startswith("/cancel"):
                 return self._send(200, json.dumps(handle_cancel(self.path.split("?",1)[1] if "?" in self.path else "")))
             if self.path == "/save":      return self._send(200, json.dumps(handle_save(self._json())))
